@@ -1,0 +1,180 @@
+#  -*-coding:utf8 -*-
+"""
+
+"""
+
+import re
+import time
+from queue import Queue
+import requests
+from bs4 import BeautifulSoup
+from newspaper import Article
+from newspaper import Config
+from threading import Thread as Task
+
+from common import api
+
+
+class Xxxx:
+    def __init__(self, raw_url):
+        self.web_name = ""
+
+        self.raw_url = raw_url
+
+        # 创建 url 存储容器
+        self.url_queue = Queue()
+
+        # 创建 html 存储容器
+        self.news_link_queue = Queue()
+
+        # 创建 数据 存储容器
+        self.data_queue = Queue()
+
+    def get_url_list(self):
+        for page in range(1, 26):
+            self.url_queue.put(self.raw_url.format(page))
+
+    def get_news_link_list(self):
+        """
+        消费第一个容器中的数据，生产第二个容器中的数据
+        :return:
+        """
+        while True:
+            url = self.url_queue.get()
+            try:
+                response = requests.get(url).text
+                soup = BeautifulSoup(response, 'lxml')
+                _ = soup.find('ul', attrs={'class': 'list-lm pad10'}).find_all('li')
+                for item in _:
+                    new_url = item.find('a')['href']
+                    new_full_url = parse.urljoin(url, new_url)
+                    self.news_link_queue.put(new_full_url)
+
+                self.url_queue.task_done()
+                print("############第1个容器剩余任务数：", self.url_queue.unfinished_tasks)
+            except Exception as e:
+                self.url_queue.task_done()
+                print("生成数据的时候出错拉!!!!!!!!错误时：", e)
+                print("错误的url:", url)
+                print("############第1个容器剩余任务数：", self.url_queue.unfinished_tasks)
+                continue
+    def generate_upload_data(self):
+        """
+        消费第二个容器中存储的新闻url,生产数据存入第三个容器
+        :return:
+        """
+        while True:
+            url = self.news_link_queue.get()
+            try:
+                # 获取publish_time
+                response = requests.get(url).content.decode('utf-8')
+                pass
+
+                # 初始化newspaper
+                user_agent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 ' \
+                             '(KHTML, like Gecko) Chrome/77.0.3865.90 Safari/537.36'
+                config = Config()
+                config.browser_user_agent = user_agent
+                article = Article(url, config=config, language='zh')
+                article.download()
+                article.parse()
+
+                # 利用newspaper对象拼接数据
+                dict_item = {"content_info": {}}
+                dict_item["content_info"]["source_domain_url"] = ""
+                dict_item["content_info"]["publish_time"] = publish_time
+                dict_item["content_info"]["source_website_name"] = ""
+                dict_item["content_info"]["source_website_name_cn"] = ""
+                dict_item["content_info"]["title_en"] = article.title
+                dict_item["content_info"]["types"] = "news"
+                dict_item["content_info"]["source_full_destination_url"] = url.strip()
+                dict_item["content_info"]["content_en"] = article.text
+
+                # 把拼好的数据存入第三个容器中
+                self.data_queue.put(dict_item)
+                self.news_link_queue.task_done()
+                print("############################################第2个容器剩余任务数：", self.news_link_queue.unfinished_tasks)
+            except Exception as e:
+                self.news_link_queue.task_done()
+                print("生成数据的时候出错拉!!!!!!!!错误时：", e)
+                print("############################################第2个容器剩余任务数：", self.news_link_queue.unfinished_tasks)
+                continue
+
+    def upload_data(self):
+        """
+        消费第三个容器中存储的新闻数据,保存进数据库
+        :return:
+        """
+        while True:
+            json_data = self.data_queue.get()
+            # 上传拼接好的数据到数据库
+            try:
+                outside_api_caller = api.IntellifeedAPICaller()
+                response = outside_api_caller.new_content(json_data)
+                if response and response.status_code in [200, 201]:
+                    print('{%s scrawl Successfully, status_code is %s }' % (
+                        self.web_name, response.status_code))
+                elif response.status_code == 400:
+                    print(' 400 error pls, check the format ')
+                    outside_api_caller.send_slack_notification('[ %s Scrawl Process Fail, '
+                                                               'the status code is %s ]' % (
+                                                                   self.web_name, response.status_code))
+                elif response.status_code == 500:
+                    error_info = '500 error message, website name is'.format(self.web_name)
+                    outside_api_caller.send_slack_notification(error_info)
+                else:
+                    outside_api_caller.send_slack_notification('[ %s Scrawl Process Fail, '
+                                                               'the status code is %s ]' % (
+                                                                   self.web_name, response.status_code))
+            except Exception as e:
+                outside_api_caller.send_slack_notification(
+                    '[ %s Scrawl Process Exception ], the error code is %s' % (self.web_name, e))
+            else:
+                outside_api_caller.send_slack_notification(
+                    '[ %s Scrawl Process Success ENDING ]' % self.web_name)
+            self.data_queue.task_done()
+            print("###############################################第3个容器剩余任务数：", self.data_queue.unfinished_tasks)
+
+    def run(self):
+        # 定义所有的任务列表
+        tasks = []
+
+        # 生产 URL 任务放在子线程上运行
+        get_url_list_task = Task(target=self.get_url_list)
+        tasks.append(get_url_list_task)
+
+        # 消费 URL 生产新闻链接  放在子线程上运行
+        for i in range(2):
+            get_news_link_list_task = Task(target=self.get_news_link_list)
+            tasks.append(get_news_link_list_task)
+
+        # 消费 新闻链接, 生产拼接好的数据 放在子线程上运行
+        for i in range(8):
+            generate_upload_data_task = Task(target=self.generate_upload_data)
+            tasks.append(generate_upload_data_task)
+
+        # 消费数据的任务
+        for i in range(8):
+            upload_data_task = Task(target=self.upload_data)
+            tasks.append(upload_data_task)
+
+        # 让所有子线程启动并且以守护线程运行
+        for task in tasks:
+            task.setDaemon(True)
+            task.start()
+
+        # 保证子线程必须运行
+        time.sleep(2)
+
+        # 设置主线程退出条件
+        for queue in [self.url_queue, self.news_link_queue, self.data_queue]:
+            queue.join()
+        pass
+
+
+if __name__ == '__main__':
+    url_li = [
+
+    ]
+    for ulr in url_li:
+        pass
